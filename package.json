@@ -1,0 +1,14 @@
+{
+  "name": "opencode-session-search-local",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "bun build ./plugins/session-search.ts --target bun --outfile /dev/null && ./bin/session-search --help >/dev/null",
+    "sync": "./bin/session-search --sync-only",
+    "rebuild": "./bin/session-search --rebuild --sync-only"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.4.3"
+  }
+}

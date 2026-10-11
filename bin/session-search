@@ -1,0 +1,405 @@
+#!/usr/bin/env bun
+
+import { Database } from "bun:sqlite"
+import { existsSync, mkdirSync, rmSync } from "node:fs"
+import { dirname, join } from "node:path"
+import { spawnSync } from "node:child_process"
+
+type Role = "both" | "user" | "assistant"
+
+type Options = {
+  query: string
+  days: number
+  limit: number
+  directory?: string
+  role: Role
+  includeSubagents: boolean
+  json: boolean
+  pick: boolean
+  noSync: boolean
+  rebuild: boolean
+  syncOnly: boolean
+}
+
+type SessionMeta = {
+  id: string
+  title: string
+  directory: string
+  parent_id: string | null
+  time_created: number
+  time_updated: number
+}
+
+type SearchRow = SessionMeta & {
+  rank: number
+  user_snippet: string
+  assistant_snippet: string
+}
+
+const home = process.env.HOME || ""
+const cachePath =
+  process.env.OPENCODE_SESSION_SEARCH_INDEX ||
+  join(process.env.XDG_CACHE_HOME || join(home, ".cache"), "opencode", "session-search.db")
+
+function usage() {
+  console.log(`Usage: session-search [options] <query>
+
+Search OpenCode sessions using a local SQLite FTS5 index.
+
+Options:
+  --days N             Only sessions updated in the last N days
+  --limit N            Number of results (default: 10, max: 100)
+  --directory TEXT     Filter by directory substring
+  --role ROLE          both, user, or assistant (default: both)
+  --include-subagents  Include child/subagent sessions
+  --pick               Select a result with fzf and resume it
+  --json               Print machine-readable JSON
+  --no-sync            Search without refreshing the index
+  --sync-only          Refresh the index without searching
+  --rebuild            Rebuild the complete index
+  -h, --help           Show this help
+
+Examples:
+  session-search dashboard CVE --days 7
+  session-search "dev dashboard" --pick
+  session-search --rebuild --sync-only`)
+}
+
+function parseArgs(argv: string[]): Options {
+  const options: Options = {
+    query: "",
+    days: 0,
+    limit: 10,
+    role: "both",
+    includeSubagents: false,
+    json: false,
+    pick: false,
+    noSync: false,
+    rebuild: false,
+    syncOnly: false,
+  }
+  const query: string[] = []
+
+  for (let index = 0; index < argv.length; index++) {
+    const arg = argv[index]
+    const next = () => {
+      const value = argv[++index]
+      if (value === undefined) throw new Error(`${arg} requires a value`)
+      return value
+    }
+
+    if (arg === "-h" || arg === "--help") {
+      usage()
+      process.exit(0)
+    } else if (arg === "--days") {
+      options.days = Number(next())
+    } else if (arg === "--limit") {
+      options.limit = Number(next())
+    } else if (arg === "--directory") {
+      options.directory = next()
+    } else if (arg === "--role") {
+      options.role = next() as Role
+    } else if (arg === "--include-subagents") {
+      options.includeSubagents = true
+    } else if (arg === "--pick") {
+      options.pick = true
+    } else if (arg === "--json") {
+      options.json = true
+    } else if (arg === "--no-sync") {
+      options.noSync = true
+    } else if (arg === "--sync-only") {
+      options.syncOnly = true
+    } else if (arg === "--rebuild") {
+      options.rebuild = true
+    } else if (arg.startsWith("-")) {
+      throw new Error(`unknown option: ${arg}`)
+    } else {
+      query.push(arg)
+    }
+  }
+
+  if (!Number.isInteger(options.days) || options.days < 0 || options.days > 3650) {
+    throw new Error("--days must be an integer between 0 and 3650")
+  }
+  if (!Number.isInteger(options.limit) || options.limit < 1 || options.limit > 100) {
+    throw new Error("--limit must be an integer between 1 and 100")
+  }
+  if (!(["both", "user", "assistant"] as string[]).includes(options.role)) {
+    throw new Error("--role must be both, user, or assistant")
+  }
+
+  options.query = query.join(" ").trim()
+  if (!options.query && !options.syncOnly && !options.rebuild) {
+    throw new Error("a search query is required")
+  }
+  return options
+}
+
+function resolveSourcePath() {
+  if (process.env.OPENCODE_DB_PATH) return process.env.OPENCODE_DB_PATH
+
+  const defaultPath = join(process.env.XDG_DATA_HOME || join(home, ".local", "share"), "opencode", "opencode.db")
+  if (existsSync(defaultPath)) return defaultPath
+
+  const result = spawnSync("opencode", ["db", "path"], { encoding: "utf8" })
+  const path = result.status === 0 ? result.stdout.trim() : ""
+  if (!path) throw new Error("could not locate the OpenCode database")
+  return path
+}
+
+function openIndex(rebuild: boolean) {
+  mkdirSync(dirname(cachePath), { recursive: true })
+  if (rebuild) {
+    for (const suffix of ["", "-wal", "-shm"]) rmSync(`${cachePath}${suffix}`, { force: true })
+  }
+
+  const db = new Database(cachePath, { create: true, strict: true })
+  db.exec(
+    "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA temp_store = MEMORY; PRAGMA busy_timeout = 5000;",
+  )
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS indexed_sessions (
+      session_id TEXT PRIMARY KEY,
+      time_updated INTEGER NOT NULL
+    );
+    CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
+      session_id UNINDEXED,
+      title,
+      directory,
+      user_content,
+      assistant_content,
+      time_created UNINDEXED,
+      time_updated UNINDEXED,
+      parent_id UNINDEXED,
+      tokenize = 'unicode61 remove_diacritics 2'
+    );
+  `)
+  return db
+}
+
+function syncIndex(source: Database, index: Database) {
+  const sessions = source
+    .query(
+      `SELECT id, title, directory, parent_id, time_created, time_updated
+       FROM session`,
+    )
+    .all() as SessionMeta[]
+  const indexed = new Map(
+    (index.query("SELECT session_id, time_updated FROM indexed_sessions").all() as Array<{
+      session_id: string
+      time_updated: number
+    }>).map((row) => [row.session_id, row.time_updated]),
+  )
+  const sourceIds = new Set(sessions.map((session) => session.id))
+  const changed = sessions.filter((session) => indexed.get(session.id) !== session.time_updated)
+  const removed = [...indexed.keys()].filter((id) => !sourceIds.has(id))
+
+  if (!changed.length && !removed.length) return { changed: 0, removed: 0 }
+
+  console.error(`Refreshing search index: ${changed.length} changed, ${removed.length} removed`)
+
+  const deleteFts = index.query("DELETE FROM sessions_fts WHERE session_id = ?")
+  const deleteMeta = index.query("DELETE FROM indexed_sessions WHERE session_id = ?")
+  const insertFts = index.query(`
+    INSERT INTO sessions_fts (
+      session_id, title, directory, user_content, assistant_content,
+      time_created, time_updated, parent_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `)
+  const upsertMeta = index.query(`
+    INSERT INTO indexed_sessions (session_id, time_updated) VALUES (?, ?)
+    ON CONFLICT(session_id) DO UPDATE SET time_updated = excluded.time_updated
+  `)
+  const writeSession = index.transaction(
+    (session: SessionMeta, userContent: string, assistantContent: string) => {
+      deleteFts.run(session.id)
+      insertFts.run(
+        session.id,
+        session.title,
+        session.directory,
+        userContent,
+        assistantContent,
+        session.time_created,
+        session.time_updated,
+        session.parent_id,
+      )
+      upsertMeta.run(session.id, session.time_updated)
+    },
+  )
+  const removeSession = index.transaction((id: string) => {
+    deleteFts.run(id)
+    deleteMeta.run(id)
+  })
+
+  for (const id of removed) removeSession(id)
+
+  const partQuery = source.query(`
+    SELECT
+      json_extract(m.data, '$.role') AS role,
+      json_extract(p.data, '$.text') AS text
+    FROM part p
+    JOIN message m ON m.id = p.message_id
+    WHERE p.session_id = ?
+      AND instr(p.data, '"type":"text"') > 0
+      AND json_extract(m.data, '$.role') IN ('user', 'assistant')
+    ORDER BY p.time_created
+  `)
+
+  changed.forEach((session, position) => {
+    const user: string[] = []
+    const assistant: string[] = []
+    for (const row of partQuery.iterate(session.id) as Iterable<{ role: string; text: string | null }>) {
+      if (!row.text) continue
+      if (row.role === "user") user.push(row.text)
+      else assistant.push(row.text)
+    }
+    writeSession(session, user.join("\n"), assistant.join("\n"))
+    if ((position + 1) % 250 === 0) console.error(`Indexed ${position + 1}/${changed.length} sessions`)
+  })
+
+  if (changed.length + removed.length > 100) {
+    index.exec("INSERT INTO sessions_fts(sessions_fts) VALUES('optimize')")
+  }
+  return { changed: changed.length, removed: removed.length }
+}
+
+function ftsQuery(query: string, role: Role) {
+  const columns =
+    role === "user"
+      ? ["title", "directory", "user_content"]
+      : role === "assistant"
+        ? ["title", "directory", "assistant_content"]
+        : ["title", "directory", "user_content", "assistant_content"]
+  const terms = query.split(/\s+/).filter(Boolean)
+  return terms
+    .map((term) => {
+      const quoted = `"${term.replace(/"/g, '""')}"`
+      return `(${columns.map((column) => `${column}:${quoted}`).join(" OR ")})`
+    })
+    .join(" AND ")
+}
+
+function search(index: Database, options: Options) {
+  const filters = ["sessions_fts MATCH ?"]
+  const params: Array<string | number> = [ftsQuery(options.query, options.role)]
+
+  if (!options.includeSubagents) filters.push("parent_id IS NULL")
+  if (options.days > 0) {
+    filters.push("CAST(time_updated AS INTEGER) >= ?")
+    params.push(Date.now() - options.days * 24 * 60 * 60 * 1000)
+  }
+  if (options.directory) {
+    filters.push("lower(directory) LIKE ? ESCAPE '\\'")
+    params.push(`%${options.directory.toLowerCase().replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_")}%`)
+  }
+
+  params.push(options.limit)
+  return index
+    .query(
+      `SELECT
+         session_id AS id,
+         title,
+         directory,
+         CAST(time_created AS INTEGER) AS time_created,
+         CAST(time_updated AS INTEGER) AS time_updated,
+         parent_id,
+         bm25(sessions_fts, 0.0, 10.0, 5.0, 1.5, 1.0, 0.0, 0.0, 0.0) AS rank,
+         snippet(sessions_fts, 3, '[', ']', '...', 36) AS user_snippet,
+         snippet(sessions_fts, 4, '[', ']', '...', 36) AS assistant_snippet
+       FROM sessions_fts
+       WHERE ${filters.join(" AND ")}
+       ORDER BY rank, CAST(time_updated AS INTEGER) DESC
+       LIMIT ?`,
+    )
+    .all(...params) as SearchRow[]
+}
+
+function resultPayload(options: Options, rows: SearchRow[]) {
+  return {
+    query: options.query,
+    filters: {
+      days: options.days || "all",
+      directory: options.directory || "all",
+      role: options.role,
+      includeSubagents: options.includeSubagents,
+    },
+    resultCount: rows.length,
+    sessions: rows.map((row) => {
+      const snippetCandidates =
+        options.role === "user"
+          ? [row.user_snippet]
+          : options.role === "assistant"
+            ? [row.assistant_snippet]
+            : [row.user_snippet, row.assistant_snippet]
+      const snippets = snippetCandidates
+        .map((text) => text.replace(/\s+/g, " ").trim())
+        .filter(Boolean)
+      return {
+        sessionId: row.id,
+        title: row.title,
+        directory: row.directory,
+        created: new Date(row.time_created).toISOString(),
+        updated: new Date(row.time_updated).toISOString(),
+        score: row.rank,
+        snippets,
+        resumeCommand: `opencode -s ${row.id}`,
+      }
+    }),
+  }
+}
+
+function printResults(payload: ReturnType<typeof resultPayload>) {
+  if (!payload.sessions.length) {
+    console.log(`No sessions found for "${payload.query}".`)
+    return
+  }
+
+  for (const [index, session] of payload.sessions.entries()) {
+    console.log(`${index + 1}. ${session.title}  ${session.updated.slice(0, 10)}`)
+    console.log(`   ${session.directory}`)
+    if (session.snippets[0]) console.log(`   ${session.snippets[0]}`)
+    console.log(`   ${session.resumeCommand}`)
+  }
+}
+
+function pickSession(rows: SearchRow[]) {
+  if (!rows.length) return undefined
+  const input = rows
+    .map((row) => `${row.id}\t${new Date(row.time_updated).toISOString().slice(0, 10)}\t${row.title}\t${row.directory}`)
+    .join("\n")
+  const selected = spawnSync(
+    "fzf",
+    ["--delimiter=\t", "--with-nth=2..", "--prompt=OpenCode session> "],
+    { input, encoding: "utf8", stdio: ["pipe", "pipe", "inherit"] },
+  )
+  if (selected.status !== 0 || !selected.stdout.trim()) return undefined
+  return selected.stdout.split("\t", 1)[0]
+}
+
+try {
+  const options = parseArgs(Bun.argv.slice(2))
+  const source = new Database(resolveSourcePath(), { readonly: true, create: false, strict: true })
+  const index = openIndex(options.rebuild)
+  let selectedSessionId: string | undefined
+
+  try {
+    if (!options.noSync) syncIndex(source, index)
+    if (!options.syncOnly && (!options.rebuild || options.query)) {
+      const rows = search(index, options)
+      const payload = resultPayload(options, rows)
+      if (options.json) console.log(JSON.stringify(payload, null, 2))
+      else printResults(payload)
+      if (options.pick) selectedSessionId = pickSession(rows)
+    }
+  } finally {
+    index.close()
+    source.close()
+  }
+  if (selectedSessionId) {
+    const resumed = spawnSync("opencode", ["-s", selectedSessionId], { stdio: "inherit" })
+    process.exit(resumed.status ?? 1)
+  }
+} catch (error) {
+  console.error(`session-search: ${error instanceof Error ? error.message : String(error)}`)
+  process.exit(1)
+}
